@@ -1,0 +1,17 @@
+[package]
+name = "combine-bytes-json"
+version = "0.1.0"
+authors = ["Roman Friedman <friedrom@gmail.com>"]
+cargo-features = ["edition"]
+edition = "2018"
+
+[dependencies]
+bytes = "0.4"
+log = "*"
+combine = "3.3.0"
+bencher = "0.1"
+fnv = "1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
