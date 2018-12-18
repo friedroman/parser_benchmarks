@@ -17,7 +17,8 @@ use combine::{
         FastResult::*,
         Info,
         StreamError,
-        UnexpectedParse
+        UnexpectedParse,
+        Tracked
     },
     ParseError,
     Positioned,
@@ -27,21 +28,20 @@ use combine::{
         PointerOffset,
         Range,
         Resetable,
-        StreamErrorFor
+        StreamErrorFor,
+        FullRangeStream,
+        input_at_eof,
+        state::DefaultPositioned,
+        state::IndexPositioner,
+        wrap_stream_error
     },
-    StreamOnce
+    StreamOnce,
+    ConsumedResult,
+    easy::Stream,
+    Parser,
+    parser::function::parser,
+    parser::ParseMode,
 };
-use combine::ConsumedResult;
-use combine::easy::Stream;
-use combine::error::Tracked;
-use combine::Parser;
-use combine::parser::function::parser;
-use combine::parser::ParseMode;
-use combine::stream::FullRangeStream;
-use combine::stream::input_at_eof;
-use combine::stream::state::DefaultPositioned;
-use combine::stream::state::IndexPositioner;
-use combine::stream::wrap_stream_error;
 use log::trace;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
@@ -309,7 +309,7 @@ impl RangeStreamOnce for BytesBuf {
         } else {
             Err(UnexpectedParse::Eoi)
         };
-        //println!("Bytes uncons_range {:?} : {:?}", size, result.as_ref().map(|b| printbuf(&*b.0)));
+        //println!("Bytes uncons_range {:?} : {:?}", size, result.as_ref().map(|b| String::from_utf8_lossy(&*b.0)));
         result
     }
     

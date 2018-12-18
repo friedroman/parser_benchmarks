@@ -4,6 +4,7 @@ extern crate bencher;
 extern crate combine;
 
 use std::hash::Hash;
+use std::result::Result::Ok;
 use std::str;
 
 use bencher::{Bencher, black_box};
@@ -14,7 +15,9 @@ use combine::{
         Consumed,
         Info,
         ParseError,
-        ParseResult2
+        ParseResult2,
+        StreamError,
+        Tracked
     },
     Parser,
     parser,
@@ -38,6 +41,7 @@ use combine::{
     StreamOnce,
 };
 use combine::range::TakeWhile1;
+use combine::stream::wrap_stream_error;
 
 use crate::{
     byterange::BytesBuf,
@@ -46,7 +50,6 @@ use crate::{
     byterange::SkipRangeStream,
     byterange::SkipWhile
 };
-use std::result::Result::Ok;
 use crate::byterange::skip_while1;
 
 pub mod byterange;
@@ -98,9 +101,9 @@ fn lex_around<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
           <P::Input as StreamOnce>::Position,
       >
 {
-    (no_partial(spaces()), p, no_partial(spaces()))
-                 //this doesn't look very good :)
-                 .map(|(_, o, _)| o)
+    (spaces(), p, spaces())
+      //this doesn't look very good :)
+      .map(|(_, o, _)| o)
 }
 
 
@@ -155,7 +158,7 @@ fn json_string<I>() -> impl Parser<Input=I, Output=BytesRange>
         b'\\',
         back_slash_byte,
     ));
-    inspect("string", between(byte(b'"'), byte(b'"'), inner))
+    inspect("string", inner.skip(byte(b'"')))
 }
 
 fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>>
@@ -163,10 +166,10 @@ fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>>
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
-    let field = (json_string().map(|bytes| bytes.0), lex(byte(b':')), json_value()).map(|t| (t.0, t.2));
+    let field = ((byte(b'"').with(json_string())).map(|bytes| bytes.0), lex(byte(b':')), json_value()).map(|t| (t.0, t.2));
     let fields = sep_by(field, lex_around(byte(b',')));
     inspect("object",
-    between(byte(b'{').skip(spaces()), lex(byte(b'}')), fields))
+    between(spaces(), lex(byte(b'}')), fields))
 }
 
 fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>>
@@ -174,11 +177,11 @@ fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>>
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
-    inspect("array", between(
-        byte(b'['),
-        lex(byte(b']')),
-        sep_by(json_value(), lex(byte(b','))),
-    ))
+    inspect(
+        "array",
+        sep_by(json_value(), lex(byte(b',')))
+          .skip(lex(byte(b']'))),
+    )
 }
 
 #[inline(always)]
@@ -198,6 +201,7 @@ fn value<I>(buf: &'static str) -> impl Parser<Input=I, Output=()>
       .map(|_| ()))
 }
 
+#[inline(always)]
 fn inspect<P>(buf: &'static str, p: P) -> impl Parser<Input=P::Input, Output=P::Output>
     where P: Parser,
           P::Input: SkipRangeStream<Item=u8, Range=BytesRange>,
@@ -206,11 +210,12 @@ fn inspect<P>(buf: &'static str, p: P) -> impl Parser<Input=P::Input, Output=P::
               <P::Input as StreamOnce>::Range,
               <P::Input as StreamOnce>::Position> {
     
-    parser(move |input| {
-        //println!("Parser {}", buf);
-        Ok(((), Consumed::Empty(())))
-    }).with(p)
-      .expected(buf)
+    p.expected(buf)
+//    parser(move |input| {
+//        //println!("Parser {}", buf);
+//        Ok(((), Consumed::Empty(())))
+//    }).with(p)
+//      .expected(buf)
 }
 // We need to use `parser!` to break the recursive use of `value` to prevent the returned parser
 // from containing itself
@@ -219,15 +224,27 @@ parser! {
     fn json_value_[I]()(I) -> Value
         where [ I: SkipRangeStream<Item = u8, Range = BytesRange> ]
     {
-        choice((
-            json_string().map(|b| Value::String(b.0)),
-            object().map(Value::Object),
-            array().map(Value::Array),
-            number().map(|b| Value::Number(b.0)),
-            value("false").map(|_| Value::Bool(false)),
-            value("true").map(|_| Value::Bool(true)),
-            value("null").map(|_| Value::Null),
-        ))
+        parser(|mut i: &mut I| {
+            //println!("Parser Value");
+            let before = i.checkpoint();
+            let x = match i.uncons() {
+                Ok(b) => b,
+                Err(e) => return wrap_stream_error(i, e).into()
+            };
+            match x {
+                b'[' => array().map(Value::Array).parse_stream(i),
+                b'{' => object().map(Value::Object).parse_stream(i),
+                b'\"' => json_string().map(|b| Value::String(b.0)).parse_stream(i),
+                b'f' => value("alse").map(|_| Value::Bool(false)).parse_stream(i),
+                b't' => value("rue").map(|_| Value::Bool(true)).parse_stream(i),
+                b'n' => value("ull").map(|_| Value::Null).parse_stream(i),
+                b'0'...b'9' | b'+' | b'-' | b'.' => {
+                    i.reset(before);
+                    number().map(|n| Value::Number(n.0)).parse_stream(i)
+                },
+                t => return Err(Consumed::Consumed(Tracked::from(I::Error::from_error(i.position(), StreamError::unexpected_token(t))))),
+            }
+        })
     }
 }
 
@@ -345,7 +362,7 @@ fn apache(b: &mut Bencher) {
 
 //deactivating the "basic" benchmark because the parser fails on this one
 //benchmark_group!(json, basic, data, apache, canada);
-benchmark_group!(json, data);
+benchmark_group!(json, basic, data, apache, canada);
 benchmark_main!(json);
 
 /*
