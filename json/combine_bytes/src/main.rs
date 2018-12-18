@@ -16,9 +16,9 @@ use combine::{
     Parser,
     parser,
     parser::{
-        byte::{byte, bytes, digit, spaces},
+        byte::{byte, bytes, digit},
         choice::{choice, optional},
-        combinator::no_partial,
+        combinator::{ignore, no_partial},
         item::{one_of, satisfy_map},
         range,
         repeat::{escaped, many, many1, sep_by},
@@ -36,7 +36,10 @@ use combine::{
 };
 use combine::range::TakeWhile1;
 
-use self::byterange::BytesRange;
+use crate::{
+    byterange::BytesRange,
+    byterange::BytesBuf
+};
 
 pub mod byterange;
 
@@ -50,7 +53,21 @@ enum Value {
     Array(Vec<Value>),
 }
 
-fn lex<'a, P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
+fn spaces<I>() -> impl Parser<Input=I, Output=BytesRange>
+    where
+      I: RangeStream<Item=u8, Range=BytesRange>,
+      I::Error: ParseError<
+          I::Item,
+          I::Range,
+          I::Position,
+      >
+{
+    range::take_while(|b| {
+        b == b' ' || b == b'\t' || b == b'\r' || b == b'\n'
+    })
+}
+
+fn lex<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
     where
       P: Parser,
       P::Input: RangeStream<Item=u8, Range=BytesRange>,
@@ -60,10 +77,24 @@ fn lex<'a, P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
           <P::Input as StreamOnce>::Position,
       >
 {
-    no_partial(p.skip(range::take_while(|b| {
-        b == b' ' || b == b'\t' || b == b'\r' || b == b'\n'
-    })))
+    no_partial(spaces().with(p))
 }
+
+fn lex_around<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
+    where
+      P: Parser,
+      P::Input: RangeStream<Item=u8, Range=BytesRange>,
+      <P::Input as StreamOnce>::Error: ParseError<
+          <P::Input as StreamOnce>::Item,
+          <P::Input as StreamOnce>::Range,
+          <P::Input as StreamOnce>::Position,
+      >
+{
+    (no_partial(ignore(spaces())), p, no_partial(ignore(spaces())))
+                 //this doesn't look very good :)
+                 .map(|(_, o, _)| o)
+}
+
 
 fn digits<I>() -> TakeWhile1<I, fn(I::Item) -> bool>
     where
@@ -79,7 +110,7 @@ fn number<I>() -> impl Parser<Input=I, Output=BytesRange>
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
     no_partial(
-        lex(range::recognize(no_partial((
+        range::recognize(no_partial((
             optional(one_of("+-".bytes())),
             choice((
                 (digits(), optional((byte(b'.'), optional(digits())))).map(|_| ()),
@@ -89,7 +120,7 @@ fn number<I>() -> impl Parser<Input=I, Output=BytesRange>
                 (one_of("eE".bytes()), optional(one_of("+-".bytes()))),
                 digits(),
             )),
-        )))).expected("number"),
+        ))).expected("number"),
     )
 }
 
@@ -116,7 +147,7 @@ fn json_string<I>() -> impl Parser<Input=I, Output=BytesRange>
         b'\\',
         back_slash_byte,
     ));
-    between(lex(byte(b'"')), lex(byte(b'"')), inner).expected("string")
+    between(byte(b'"'), byte(b'"'), inner).expected("string")
 }
 
 fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>>
@@ -125,8 +156,8 @@ fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>>
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
     let field = (json_string().map(|bytes| bytes.0), lex(byte(b':')), json_value()).map(|t| (t.0, t.2));
-    let fields = sep_by(field, lex(byte(b',')));
-    between(lex(byte(b'{')), lex(byte(b'}')), fields).expected("object")
+    let fields = sep_by(field, lex_around(byte(b',')));
+    between(byte(b'{').skip(spaces()), lex(byte(b'}')), fields).expected("object")
 }
 
 fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>>
@@ -135,7 +166,7 @@ fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>>
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
     between(
-        lex(byte(b'[')),
+        byte(b'['),
         lex(byte(b']')),
         sep_by(json_value(), lex(byte(b','))),
     ).expected("array")
@@ -147,7 +178,7 @@ fn json_value<I>() -> impl Parser<Input=I, Output=Value>
       I: RangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
-    lex(json_value_())
+    lex_around(json_value_())
 }
 
 // We need to use `parser!` to break the recursive use of `value` to prevent the returned parser
@@ -175,9 +206,9 @@ fn json_test() {
     use bytes::Bytes;
     use self::BytesRange;
     let input = br#"{
-        "array": [1, ""],
-        "object": {},
-        "number": 3.14,
+        "array" : [1, ""],
+        "object" :  {},
+        "number" : 3.14,
         "small_number": 0.59,
         "int": -100,
         "exp": -1e2,
@@ -191,7 +222,7 @@ fn json_test() {
             Bytes::from_static($str)
         }
     }
-    let result = json_value().easy_parse(BytesRange(Bytes::from_static(&*input)));
+    let result = json_value().easy_parse(BytesBuf::new(Bytes::from_static(&*input)));
     let expected = Object(
         vec![
             (b!(b"array"), Array(vec![Number(b!(b"1")), String(b!(b""))])),
@@ -208,7 +239,7 @@ fn json_test() {
          .collect(),
     );
     match result {
-        Ok(result) => assert_eq!(result, (expected, BytesRange(Bytes::new()))),
+        Ok((result, input)) => assert_eq!(result, expected),
         Err(e) => {
             println!("{}\n{:?}", e, e);
             assert!(false);
@@ -216,15 +247,41 @@ fn json_test() {
     }
 }
 
-fn parse(b: &mut Bencher, buffer: &str) {
+#[test]
+fn test() {
+    let data = "  { \"a\"\t: 42,
+  \"b\": [ \"x\", \"y\", 12 ] ,
+  \"c\": { \"hello\" : \"world\"
+  }
+  }  ";
+    //let data = include_str!("../../test.json");
+    
     let mut parser = json_value();
-    b.iter(|| {
-        let buf = black_box(BytesRange(Bytes::from(buffer.as_bytes())));
+    let result = parser.easy_parse(BytesBuf::new(Bytes::from_static(data.as_bytes())));
+    println!("test: {:?}", result);
+    result.unwrap();
+}
 
+#[test]
+fn apache_test() {
+    let data = include_str!("../../apache_builds.json");
+    let mut parser = json_value();
+    let result = parser.easy_parse(BytesBuf::new (Bytes::from_static(data.as_bytes())));
+    println!("test: {:?}", result);
+    result.unwrap();
+}
+
+fn parse(b: &mut Bencher, buffer: &'static str) {
+    let mut parser = json_value();
+    let bytes = Bytes::from(buffer.as_bytes());
+    b.iter(|| {
+        let buf = black_box(BytesBuf::new(bytes.clone()));
+        
         let result = parser.easy_parse(buf).unwrap();
         black_box(result)
     });
 }
+
 
 fn basic(b: &mut Bencher) {
     let data = "  { \"a\"\t: 42,
@@ -247,21 +304,6 @@ fn canada(b: &mut Bencher) {
     let data = include_str!("../../canada.json");
     b.bytes = data.len() as u64;
     parse(b, data)
-}
-
-#[test]
-fn test() {
-    let data = "  { \"a\"\t: 42,
-  \"b\": [ \"x\", \"y\", 12 ] ,
-  \"c\": { \"hello\" : \"world\"
-  }
-  }  ";
-    //let data = include_str!("../../test.json");
-
-    let mut parser = json_value();
-    let result = parser.easy_parse(BytesRange(Bytes::from_static(data.as_bytes())));
-    println!("test: {:?}", result);
-    result.unwrap();
 }
 
 fn apache(b: &mut Bencher) {
