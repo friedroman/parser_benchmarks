@@ -1,61 +1,71 @@
+#![feature(existential_type)]
 #[macro_use]
 extern crate bencher;
 #[macro_use]
 extern crate combine;
 
-use std::hash::Hash;
-use std::result::Result::Ok;
-use std::str;
+use std::{
+    hash::Hash,
+    marker::PhantomData,
+    str
+};
 
 use bencher::{Bencher, black_box};
 use bytes::Bytes;
 use combine::{
     any,
-    error::{
-        Consumed,
-        Info,
-        ParseError,
-        ParseResult2,
-        StreamError,
-        Tracked
+    combinator::{
+        between, choice,
+        escaped, ignore, many, many1, no_partial, one_of, optional,
+        ParserSequenceState, PartialState2, PartialState3,
+        satisfy_map, sep_by, SequenceState, tokens, Y
     },
+    ConsumedResult,
+    easy,
     Parser,
     parser,
     parser::{
         byte::{byte, bytes, digit},
-        choice::{choice, optional},
-        combinator::{ignore, no_partial},
-        item::{self, one_of, satisfy_map, tokens},
-        range,
-        repeat::{escaped, many, many1, sep_by},
-        sequence::between,
+        FirstMode,
+        item::{self},
+        ParseMode,
+        PartialMode,
+        range
     },
     ParseResult,
+    range::TakeWhile1,
     RangeStream,
     satisfy,
     stream::{
+        decode,
         Range,
         StreamErrorFor,
+        wrap_stream_error
     },
     Stream,
     StreamOnce,
 };
-use combine::range::TakeWhile1;
-use combine::stream::wrap_stream_error;
+use combine::error::Info;
+use combine::error::Tracked;
+use combine::ParseError;
+use combine::parser::combinator::any_partial_state;
+use combine::parser::combinator::AnyPartialState;
 
 use crate::{
-    byterange::BytesBuf,
-    byterange::BytesRange,
-    byterange::skip_while,
-    byterange::SkipRangeStream,
-    byterange::SkipWhile
+    byterange::{
+        BytesBuf,
+        BytesRange,
+        skip_while,
+        skip_while1,
+        SkipRangeStream,
+        SkipWhile
+    }
 };
-use crate::byterange::skip_while1;
 
 pub mod byterange;
 
 #[derive(PartialEq, Debug)]
-enum Value {
+pub enum Value {
     Number(Bytes),
     String(Bytes),
     Bool(bool),
@@ -64,7 +74,7 @@ enum Value {
     Array(Vec<Value>),
 }
 
-fn spaces<I>() -> impl Parser<Input=I, Output=I::SkipValue>
+fn spaces<I>() -> impl Parser<Input=I, Output=I::SkipValue, PartialState=usize>
     where
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<
@@ -78,7 +88,10 @@ fn spaces<I>() -> impl Parser<Input=I, Output=I::SkipValue>
     })
 }
 
-fn lex<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
+type SkipSequence<P> = SequenceState<<<P as Parser>::Input as SkipRangeStream>::SkipValue, usize>;
+type LexState<P> = PartialState2<SequenceState<(), usize>, ParserSequenceState<P>>;
+
+fn lex<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output, PartialState=LexState<P>>
     where
       P: Parser,
       P::Input: SkipRangeStream<Item=u8, Range=BytesRange>,
@@ -88,10 +101,17 @@ fn lex<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
           <P::Input as StreamOnce>::Position,
       >
 {
-    no_partial(spaces().with(p))
+    spaces().with(p)
 }
 
-fn lex_around<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
+
+type LexArState<P> = PartialState3<
+    SkipSequence<P>,
+    ParserSequenceState<P>,
+    SkipSequence<P>
+>;
+
+fn lex_around<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output, PartialState=LexArState<P>>
     where
       P: Parser,
       P::Input: SkipRangeStream<Item=u8, Range=BytesRange>,
@@ -107,7 +127,7 @@ fn lex_around<P>(p: P) -> impl Parser<Input=P::Input, Output=P::Output>
 }
 
 
-fn digits<I>() -> impl Parser<Input=I, Output=I::SkipValue>
+fn digits<I>() -> impl Parser<Input=I, Output=I::SkipValue, PartialState=()>
     where
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
@@ -115,13 +135,12 @@ fn digits<I>() -> impl Parser<Input=I, Output=I::SkipValue>
     skip_while1(|b| b >= b'0' && b <= b'9')
 }
 
-fn number<I>() -> impl Parser<Input=I, Output=BytesRange>
+fn number<I>() -> impl Parser<Input=I, Output=BytesRange, PartialState=()>
     where
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
-    no_partial(
-        inspect("number", range::recognize(no_partial((
+        inspect("number", no_partial(range::recognize((
             optional(one_of("+-".bytes())),
             choice((
                 (digits(), optional((byte(b'.'), optional(digits())))).map(|_| ()),
@@ -132,10 +151,11 @@ fn number<I>() -> impl Parser<Input=I, Output=BytesRange>
                 digits(),
             )),
         ))))
-    )
 }
 
-fn json_string<I>() -> impl Parser<Input=I, Output=BytesRange>
+type StringState = PartialState3<SequenceState<u8, ()>, SequenceState<BytesRange, ()>, SequenceState<u8, ()>>;
+
+fn json_string<I>() -> impl Parser<Input=I, Output=BytesRange, PartialState=StringState>
     where
       I: SkipRangeStream<Item=u8, Range=BytesRange>,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
@@ -158,36 +178,92 @@ fn json_string<I>() -> impl Parser<Input=I, Output=BytesRange>
         b'\\',
         back_slash_byte,
     ));
-    inspect("string", inner.skip(byte(b'"')))
+    inspect("string", between(byte(b'"'), byte(b'"'), inner))
 }
 
-fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>>
+type SkipSequenceInput<I> = SequenceState<<I as byterange::SkipRangeStream>::SkipValue, usize>;
+
+//type ObjectState<I> = PartialState3<
+//    SkipSequenceInput<I>,
+//    SequenceState<
+//        Vec<(Bytes, Value)>,
+//        Y<(
+//            Option<Consumed<()>>,
+//            Vec<(Bytes, Value)>,
+//            PartialState2<
+//                SequenceState<
+//                    (),
+//                    PartialState3<
+//                        SkipSequenceInput<I>,
+//                        SequenceState<u8, ()>,
+//                        SkipSequenceInput<I>
+//                    >>,
+//                SequenceState<
+//                    (Bytes, Value),
+//                    PartialState3<
+//                        SequenceState<
+//                            Bytes,
+//                            PartialState2<
+//                                SequenceState<(), ()>,
+//                                SequenceState<BytesRange,StringState>
+//                            >
+//                        >,
+//                        SequenceState<
+//                            u8,
+//                            PartialState2<
+//                                SequenceState<(), usize>,
+//                                SequenceState<u8, ()>
+//                            >
+//                        >,
+//                        SequenceState<
+//                            Value,
+//                            JsonValueState<I>
+//                        >
+//                    >
+//                >
+//            >
+//        ), ()>
+//    >,
+//    SequenceState<u8, PartialState2<SequenceState<(), usize>, SequenceState<u8, ()>>>
+//>;
+
+fn object<I>() -> impl Parser<Input=I, Output=Vec<(Bytes, Value)>, PartialState=AnyPartialState>
     where
-      I: SkipRangeStream<Item=u8, Range=BytesRange>,
+      I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
+      <I as byterange::SkipRangeStream>::SkipValue: 'static
 {
-    let field = ((byte(b'"').with(json_string())).map(|bytes| bytes.0), lex(byte(b':')), json_value()).map(|t| (t.0, t.2));
+    let field = (json_string().map(|bytes| bytes.0), lex(byte(b':')), json_value()).map(|t| (t.0, t.2));
     let fields = sep_by(field, lex_around(byte(b',')));
     inspect("object",
-    between(spaces(), lex(byte(b'}')), fields))
+    any_partial_state(between(byte(b'{').skip(spaces()), lex(byte(b'}')), fields)))
 }
 
-fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>>
+fn array<I>() -> impl Parser<Input=I, Output=Vec<Value>, PartialState=AnyPartialState>
     where
-      I: SkipRangeStream<Item=u8, Range=BytesRange>,
+      I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
+      <I as byterange::SkipRangeStream>::SkipValue: 'static
 {
     inspect(
         "array",
-        sep_by(json_value(), lex(byte(b',')))
-          .skip(lex(byte(b']'))),
+        any_partial_state(
+            between(byte(b'['), lex(byte(b']')),
+            sep_by(json_value(), lex(byte(b',')))))
     )
 }
+
+type LexValueState<I> = PartialState3<
+    SequenceState<<I as SkipRangeStream>::SkipValue, usize>,
+    SequenceState<Value, ValueState<I>>,
+    SequenceState<<I as SkipRangeStream>::SkipValue, usize>,
+>;
 
 #[inline(always)]
 fn json_value<I>() -> impl Parser<Input=I, Output=Value>
     where
-      I: SkipRangeStream<Item=u8, Range=BytesRange>,
+      I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
+      <I as SkipRangeStream>::SkipValue: 'static,
       I::Error: ParseError<I::Item, I::Range, I::Position>,
 {
     lex_around(json_value_())
@@ -202,14 +278,13 @@ fn value<I>(buf: &'static str) -> impl Parser<Input=I, Output=()>
 }
 
 #[inline(always)]
-fn inspect<P>(buf: &'static str, p: P) -> impl Parser<Input=P::Input, Output=P::Output>
+fn inspect<P>(buf: &'static str, p: P) -> impl Parser<Input=P::Input, Output=P::Output, PartialState=P::PartialState>
     where P: Parser,
           P::Input: SkipRangeStream<Item=u8, Range=BytesRange>,
           <P::Input as StreamOnce>::Error: ParseError<
               <P::Input as StreamOnce>::Item,
               <P::Input as StreamOnce>::Range,
               <P::Input as StreamOnce>::Position> {
-    
     p.expected(buf)
 //    parser(move |input| {
 //        //println!("Parser {}", buf);
@@ -217,34 +292,167 @@ fn inspect<P>(buf: &'static str, p: P) -> impl Parser<Input=P::Input, Output=P::
 //    }).with(p)
 //      .expected(buf)
 }
+
 // We need to use `parser!` to break the recursive use of `value` to prevent the returned parser
 // from containing itself
-parser! {
+//parser! {
+//    #[derive(Clone)]
+//    pub struct JsonValue;
+//    type PartialState = ValueState;
+//    pub fn json_value_[I]()(I) -> Value
+//        where [ I: SkipRangeStream<Item = u8, Range = BytesRange> ]
+//    {
+////        parser(|mut i: &mut I| {
+////            //println!("Parser Value");
+////            let before = i.checkpoint();
+////            let x = match i.uncons() {
+////                Ok(b) => b,
+////                Err(e) => return wrap_stream_error(i, e).into()
+////            };
+////            match x {
+////                b'[' => array().map(Value::Array).parse_stream(i),
+////                b'{' => object().map(Value::Object).parse_stream(i),
+////                b'\"' => json_string().map(|b| Value::String(b.0)).parse_stream(i),
+////                b'f' => value("alse").map(|_| Value::Bool(false)).parse_stream(i),
+////                b't' => value("rue").map(|_| Value::Bool(true)).parse_stream(i),
+////                b'n' => value("ull").map(|_| Value::Null).parse_stream(i),
+////                b'0'...b'9' | b'+' | b'-' | b'.' => {
+////                    i.reset(before);
+////                    number().map(|n| Value::Number(n.0)).parse_stream(i)
+////                },
+////                t => return Err(Consumed::Consumed(Tracked::from(I::Error::from_error(i.position(), StreamError::unexpected_token(t))))),
+////            }
+////        })
+//        choice((
+//            json_string().map(|b| Value::String(b.0)),
+//            object().map(Value::Object),
+//            array().map(Value::Array),
+//            number().map(|b| Value::Number(b.0)),
+//            value("false").map(|_| Value::Bool(false)),
+//            value("true").map(|_| Value::Bool(true)),
+//            value("null").map(|_| Value::Null),
+//        ))
+//    }
+//}
+
+#[derive(Clone)]
+pub struct JsonValue<I>
+    where <I as StreamOnce>::Error:
+    ParseError<
+        <I as StreamOnce>::Item,
+        <I as StreamOnce>::Range,
+        <I as StreamOnce>::Position
+    >,
+          I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
+          <I as SkipRangeStream>::SkipValue: 'static
+{
+    __marker: PhantomData<fn(I) -> Value>
+}
+
+existential type ValueState<I>: Default;
+
+fn value_choice<I>() -> impl Parser<Input=I, Output=Value, PartialState=ValueState<I>>
+    where <I as StreamOnce>::Error:
+    ParseError<
+        <I as StreamOnce>::Item,
+        <I as StreamOnce>::Range,
+        <I as StreamOnce>::Position
+    >,
+          I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
+    <I as SkipRangeStream>::SkipValue: 'static
+
+{
+    choice((
+        json_string().map(|b| Value::String(b.0)),
+        object().map(Value::Object),
+        array().map(Value::Array),
+        number().map(|b| Value::Number(b.0)),
+        value("false").map(|_| Value::Bool(false)),
+        value("true").map(|_| Value::Bool(true)),
+        value("null").map(|_| Value::Null),
+    ))
+}
+
+impl<I> Parser for JsonValue<I>
+    where <I as StreamOnce>::Error:
+    ParseError<
+        <I as StreamOnce>::Item,
+        <I as StreamOnce>::Range,
+        <I as StreamOnce>::Position
+    >,
+          I: SkipRangeStream<Item=u8, Range=BytesRange> + 'static,
+          <I as SkipRangeStream>::SkipValue: 'static
+{
+    type Input = I;
+    type Output = Value;
+    type PartialState = ValueState<I>;
+    
     #[inline(always)]
-    fn json_value_[I]()(I) -> Value
-        where [ I: SkipRangeStream<Item = u8, Range = BytesRange> ]
+    fn parse_first(
+        &mut self,
+        input: &mut Self::Input,
+        state: &mut Self::PartialState,
+    ) -> ConsumedResult<Self::Output, Self::Input> {
+        self.parse_mode(FirstMode, input, state)
+    }
+    #[inline(always)]
+    fn parse_partial(
+        &mut self,
+        input: &mut Self::Input,
+        state: &mut Self::PartialState,
+    ) -> ConsumedResult<Self::Output, Self::Input> {
+        self.parse_mode(PartialMode::default(), input, state)
+    }
+    #[inline]
+    fn parse_mode_impl<M>(
+        &mut self,
+        mode: M,
+        input: &mut Self::Input,
+        state: &mut Self::PartialState,
+    ) -> ConsumedResult<Value
+        
+        , I>
+        where M: ParseMode
     {
-        parser(|mut i: &mut I| {
-            //println!("Parser Value");
-            let before = i.checkpoint();
-            let x = match i.uncons() {
-                Ok(b) => b,
-                Err(e) => return wrap_stream_error(i, e).into()
-            };
-            match x {
-                b'[' => array().map(Value::Array).parse_stream(i),
-                b'{' => object().map(Value::Object).parse_stream(i),
-                b'\"' => json_string().map(|b| Value::String(b.0)).parse_stream(i),
-                b'f' => value("alse").map(|_| Value::Bool(false)).parse_stream(i),
-                b't' => value("rue").map(|_| Value::Bool(true)).parse_stream(i),
-                b'n' => value("ull").map(|_| Value::Null).parse_stream(i),
-                b'0'...b'9' | b'+' | b'-' | b'.' => {
-                    i.reset(before);
-                    number().map(|n| Value::Number(n.0)).parse_stream(i)
-                },
-                t => return Err(Consumed::Consumed(Tracked::from(I::Error::from_error(i.position(), StreamError::unexpected_token(t))))),
-            }
-        })
+        let JsonValue { .. } = *self;
+        value_choice().parse_mode(mode, input, state)
+    }
+    
+    #[inline]
+    fn add_error(
+        &mut self,
+        errors: &mut Tracked<
+            <I as StreamOnce>::Error
+        >)
+    {
+        let JsonValue { .. } = *self;
+        let mut parser = value_choice::<I>();
+        parser.add_error(errors)
+    }
+    
+    fn add_consumed_expected_error(
+        &mut self,
+        errors: &mut Tracked<
+            <I as StreamOnce>::Error
+        >)
+    {
+        let JsonValue { .. } = *self;
+        let mut parser = value_choice::<I>();
+        parser.add_consumed_expected_error(errors)
+    }
+}
+#[inline(always)]
+pub fn json_value_<I>() -> JsonValue<I>
+    where <I as StreamOnce>::Error:
+    ParseError<
+        <I as StreamOnce>::Item,
+        <I as StreamOnce>::Range,
+        <I as StreamOnce>::Position
+    >,
+          I: SkipRangeStream<Item=u8, Range=BytesRange>
+{
+    JsonValue {
+        __marker: PhantomData
     }
 }
 
@@ -317,6 +525,36 @@ fn apache_test() {
     let result = parser.easy_parse(BytesBuf::new (Bytes::from_static(data.as_bytes())));
     //println!("test: {:?}", result);
     result.unwrap();
+}
+
+#[test]
+fn apache_incremental_test() {
+    let data = include_str!("../../apache_builds.json");
+    let mut parser = json_value();
+    let mut state = Default::default();
+    let full = Bytes::from_static(data.as_bytes());
+    let mut remaining = data.len();
+    while remaining > 0 {
+        let start = full.len() - remaining;
+        let slice = full.slice(start, start + remaining.min(86));
+        let mut buf = BytesBuf::new(slice);
+        println!("Parsing: {:?}", String::from_utf8_lossy(buf.next_bytes()));
+    
+        let result = decode(&mut parser, easy::Stream(buf), &mut state);
+        println!("Partial: {:?}", result);
+        match result {
+            Ok((_, consumed)) => { remaining -= consumed },
+            Err(e) => { panic!("ERR: {:?}", e)}
+        }
+//        remaining -= easy.0.pos();
+//        match result {
+//            ConsumedOk(r) => {},
+//            EmptyOk(r) => {},
+//            ConsumedErr(e) => { panic!("ConsumedErr: {:?}", e)},
+//            EmptyErr(e) => { panic!("EmptyErr: {:?}", e)}
+//        }
+    }
+    //println!("test: {:?}", result);
 }
 
 fn parse(b: &mut Bencher, buffer: &'static str) {

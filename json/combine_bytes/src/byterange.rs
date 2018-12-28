@@ -1,3 +1,4 @@
+#[feature(existential_type)]
 use std::{
     fmt::{
         self,
@@ -12,35 +13,35 @@ use std::marker::PhantomData;
 
 use bytes::{Buf, Bytes};
 use combine::{
+    ConsumedResult,
+    easy::Stream,
     error::{
         FastResult,
         FastResult::*,
         Info,
         StreamError,
-        UnexpectedParse,
-        Tracked
+        Tracked,
+        UnexpectedParse
     },
     ParseError,
+    Parser,
+    parser::function::parser,
+    parser::ParseMode,
     Positioned,
     RangeStream,
     RangeStreamOnce,
     stream::{
+        FullRangeStream,
+        input_at_eof,
         PointerOffset,
         Range,
         Resetable,
-        StreamErrorFor,
-        FullRangeStream,
-        input_at_eof,
         state::DefaultPositioned,
         state::IndexPositioner,
+        StreamErrorFor,
         wrap_stream_error
     },
     StreamOnce,
-    ConsumedResult,
-    easy::Stream,
-    Parser,
-    parser::function::parser,
-    parser::ParseMode,
 };
 use log::trace;
 
@@ -62,11 +63,6 @@ impl Range for BytesRange {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct BytesBuf {
-    cur: io::Cursor<Bytes>
 }
 
 pub trait SkipRangeStream: RangeStream {
@@ -115,7 +111,7 @@ pub fn skip_while<I, F>(f: F) -> SkipWhile<I, F> where I: SkipRangeStream, F: Fn
     SkipWhile { f, p: Default::default() }
 }
 
-pub fn skip_while1<I, F>(mut f: F) -> impl Parser<Input=I, Output=I::SkipValue> where I: SkipRangeStream, F: FnMut(I::Item) -> bool {
+pub fn skip_while1<I, F>(mut f: F) -> impl Parser<Input=I, Output=I::SkipValue, PartialState = ()> where I: SkipRangeStream, F: FnMut(I::Item) -> bool {
     parser(move |i: &mut I| {
         let x = i.checkpoint();
         match skip_while(&mut f).parse_stream_consumed(i) {
@@ -196,6 +192,12 @@ fn printbuf(mut buf: &[u8]) -> Cow<str> {
     String::from_utf8_lossy(b)
 }
 
+#[derive(Debug, Clone)]
+pub struct BytesBuf {
+    cur: io::Cursor<Bytes>
+}
+
+
 impl BytesBuf {
     pub fn new(b: Bytes) -> Self {
         BytesBuf { cur: io::Cursor::new(b) }
@@ -203,10 +205,20 @@ impl BytesBuf {
     
     #[inline]
     pub fn slice_while<F>(&self, f: F) -> Result<&[u8], StreamErrorFor<Self>> where F: FnMut(u8) -> bool {
-        let mut slice = self.cur.bytes();
+        let mut slice = self.next_bytes();
         let result = slice.uncons_while(f);
-        //println!("Bytes slice while: {:?}", result.map(|b| String::from_utf8_lossy(b)));
+        println!("Bytes slice while: {:?}", result.map(|b| String::from_utf8_lossy(b)));
         result
+    }
+    
+    pub fn pos(&self) -> usize{
+        self.cur.position() as usize
+    }
+    
+    #[inline(always)]
+    pub fn next_bytes(&self) -> &[u8] {
+        let pos = self.cur.position() as usize;
+        &self.cur.get_ref().as_ref()[pos..]
     }
     
     fn buf(&self) -> &Bytes {
@@ -233,8 +245,9 @@ impl StreamOnce for BytesBuf {
     
     #[inline]
     fn uncons(&mut self) -> Result<u8, StreamErrorFor<Self>> {
-        let next = self.cur.bytes().first();
-        //println!("Bytes uncons: {:?}", next.map(|s| (char::from(*s), printbuf(self.cur.bytes()))));
+        let slice = self.cur.get_ref().as_ref();
+        let next = slice.get(self.cur.position() as usize);
+        println!("Bytes uncons: {:?}", next.map(|s| (char::from(*s), printbuf(self.cur.bytes()))));
         let next = match next {
             Some(f) => *f,
             None => return Err(UnexpectedParse::Eoi)
@@ -263,7 +276,7 @@ impl SkipRangeStream for BytesBuf {
         } else {
             Err(UnexpectedParse::Eoi)
         };
-        //println!("Bytes skip range {:?} : {:?}", size, result);
+        println!("Bytes skip range {:?} : {:?}", size, result);
         result
     }
 }
@@ -287,13 +300,13 @@ impl Resetable for BytesBuf {
     
     #[inline]
     fn checkpoint(&self) -> Self::Checkpoint {
-        //println!("Checkpoint: {} {:?}", self.cur.position(), printbuf(&*self.cur.bytes()));
+        println!("Checkpoint: {} {:?}", self.cur.position(), printbuf(&*self.cur.bytes()));
         self.cur.position()
     }
     
     #[inline]
     fn reset(&mut self, checkpoint: Self::Checkpoint) {
-        //println!("Reset: {} -> {} {:?}", self.cur.position(), checkpoint, printbuf(&*self.cur.bytes()));
+        println!("Reset: {} -> {} {:?}", self.cur.position(), checkpoint, printbuf(&*self.cur.bytes()));
         self.cur.set_position(checkpoint)
     }
 }
@@ -309,14 +322,14 @@ impl RangeStreamOnce for BytesBuf {
         } else {
             Err(UnexpectedParse::Eoi)
         };
-        //println!("Bytes uncons_range {:?} : {:?}", size, result.as_ref().map(|b| String::from_utf8_lossy(&*b.0)));
+        println!("Bytes uncons_range {:?} : {:?}", size, result.as_ref().map(|b| String::from_utf8_lossy(&*b.0)));
         result
     }
     
     #[inline]
     fn uncons_while<F>(&mut self, mut f: F) -> Result<BytesRange, StreamErrorFor<Self>> where
       F: FnMut(Self::Item) -> bool {
-        //println!("Uncons while");
+        println!("Uncons while");
         let result = self.slice_while(&mut f);
         match result {
             Ok(s) if s.len() > 0 => {
@@ -337,7 +350,7 @@ impl RangeStreamOnce for BytesBuf {
         use self::FastResult::*;
         let mut slice = &*self.cur.bytes();
         let result = slice.uncons_while1(f);
-        //println!("Bytes uncons_while1: {:?}", result.map(|b| printbuf(b)));
+        println!("Bytes uncons_while1: {:?}", result.map(|b| printbuf(b)));
         match result {
             ConsumedOk(s) => {
                 let bytes = self.cur.get_ref().slice_ref(s);
@@ -352,7 +365,7 @@ impl RangeStreamOnce for BytesBuf {
     
     fn distance(&self, end: &u64) -> usize {
         let dist = self.cur.position() as usize - *end as usize;
-        //println!("Bytes distance {:?} -> {:?} res: {:?} {:?}", self.cur.position(), end, dist, printbuf(&*self.cur.bytes()));
+        println!("Bytes distance {:?} -> {:?} res: {:?} {:?}", self.cur.position(), end, dist, printbuf(&*self.cur.bytes()));
         dist
     }
 }
